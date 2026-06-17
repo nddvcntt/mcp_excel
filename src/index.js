@@ -119,6 +119,8 @@ function isSessionError(resp) {
   const message = String(error.message || parsed?.message || resp?.data || '').toLowerCase();
   return (
     error.code === -32001 ||
+    // -32600 = Bad Request: Missing session ID (uvx excel-mcp-server returns this)
+    (error.code === -32600 && message.includes('session')) ||
     status === 404 ||
     status === 410 ||
     (message.includes('session') && (
@@ -127,9 +129,50 @@ function isSessionError(resp) {
       message.includes('not found') ||
       message.includes('timeout') ||
       message.includes('terminated') ||
-      message.includes('closed')
+      message.includes('closed') ||
+      message.includes('missing')  // ← "Missing session ID"
     ))
   );
+}
+
+// ── Proxy-level persistent session ───────────────────────
+// Proxy maintains one long-lived session with upstream uvx.
+// This ensures OpenCode (and any client) never needs to manage
+// sessions themselves — the proxy injects the session automatically.
+
+let proxySessionId = null;
+let proxySessionInitializing = false;
+
+async function ensureProxySession() {
+  if (proxySessionId) return proxySessionId;
+  if (proxySessionInitializing) {
+    // Wait for concurrent init to complete
+    for (let i = 0; i < 20; i++) {
+      await new Promise(r => setTimeout(r, 200));
+      if (proxySessionId) return proxySessionId;
+    }
+    return null;
+  }
+  proxySessionInitializing = true;
+  try {
+    const sid = await initializeUpstreamSession();
+    proxySessionId = sid;
+    if (sid) console.log(`[mcp_excel] Proxy session established: ${sid}`);
+    else console.warn('[mcp_excel] Warning: upstream returned no session ID');
+    return sid;
+  } catch (err) {
+    console.error('[mcp_excel] ensureProxySession failed:', err.message);
+    return null;
+  } finally {
+    proxySessionInitializing = false;
+  }
+}
+
+function invalidateProxySession() {
+  if (proxySessionId) {
+    console.warn(`[mcp_excel] Invalidating proxy session: ${proxySessionId}`);
+  }
+  proxySessionId = null;
 }
 
 async function initializeUpstreamSession() {
@@ -340,21 +383,55 @@ app.post('/mcp', rateLimitMcp, async (req, res) => {
     }
 
     const body = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body));
+    const method = mcpRequestMethod(body);
 
     const forwardHeaders = {};
-    if (req.headers['content-type'])    forwardHeaders['content-type']    = req.headers['content-type'];
-    if (req.headers['mcp-session-id']) forwardHeaders['mcp-session-id'] = req.headers['mcp-session-id'];
-    if (req.headers['accept'])         forwardHeaders['accept']          = req.headers['accept'];
-    if (req.headers['last-event-id'])  forwardHeaders['last-event-id']   = req.headers['last-event-id'];
+    if (req.headers['content-type'])   forwardHeaders['content-type']   = req.headers['content-type'];
+    if (req.headers['accept'])         forwardHeaders['accept']         = req.headers['accept'];
+    if (req.headers['last-event-id'])  forwardHeaders['last-event-id']  = req.headers['last-event-id'];
+
+    if (method === 'initialize') {
+      // Client wants its own session — let upstream create one and capture it as our proxy session too
+      const resp = await axios.post(excelProxy.getInternalUrl() + '/mcp', body, {
+        headers: {
+          'Content-Type': forwardHeaders['content-type'] || 'application/json',
+          'Accept': forwardHeaders.accept || 'application/json, text/event-stream',
+        },
+        responseType: 'text',
+        timeout: 15000,
+        transformResponse: [(data) => data],
+        validateStatus: () => true,
+      });
+      const sid = resp.headers['mcp-session-id'] || resp.headers['x-mcp-session-id'] || null;
+      if (sid) {
+        // Update proxy session to match freshly initialized session
+        proxySessionId = sid;
+        console.log(`[mcp_excel] Proxy session refreshed via client initialize: ${sid}`);
+      }
+      return sendMcpProxyResponse(res, resp);
+    }
+
+    // Non-initialize: inject proxy session if client has none
+    const clientSessionId = req.headers['mcp-session-id'];
+    if (clientSessionId) {
+      forwardHeaders['mcp-session-id'] = clientSessionId;
+    } else {
+      // Client has no session → use or create proxy session
+      const sid = proxySessionId || await ensureProxySession();
+      if (sid) forwardHeaders['mcp-session-id'] = sid;
+    }
 
     let resp = await postToUpstreamMcp(body, forwardHeaders);
-    if (mcpRequestMethod(body) !== 'initialize' && isSessionError(resp)) {
-      console.warn('[mcp_excel] Upstream session expired; reinitializing and retrying once.');
-      const freshSessionId = await initializeUpstreamSession();
+
+    if (isSessionError(resp)) {
+      console.warn('[mcp_excel] Session error detected; reinitializing proxy session and retrying...');
+      invalidateProxySession();
+      const freshSessionId = await ensureProxySession();
       if (freshSessionId) forwardHeaders['mcp-session-id'] = freshSessionId;
       else delete forwardHeaders['mcp-session-id'];
       resp = await postToUpstreamMcp(body, forwardHeaders);
     }
+
     sendMcpProxyResponse(res, resp);
 
   } catch (err) {
@@ -397,8 +474,10 @@ app.listen(PORT, () => {
 ║  Tools    : GET  http://localhost:${PORT}/tools   ║
 ╚══════════════════════════════════════════════════╝
 `);
-  // Warm-up subprocess ngay khi server bật
-  excelProxy.startSubprocess().catch(e => console.error('[mcp_excel] Warm-up error:', e.message));
+  // Warm-up subprocess ngay khi server bật, sau đó initialize proxy session
+  excelProxy.startSubprocess()
+    .then(() => ensureProxySession())
+    .catch(e => console.error('[mcp_excel] Warm-up error:', e.message));
 });
 
 // Graceful shutdown
